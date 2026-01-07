@@ -1,0 +1,57 @@
+# Git
+.git/
+.gitignore
+
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Next.js build output
+.next/
+out/
+build/
+
+# Testing
+coverage/
+.nyc_output/
+__tests__/
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx
+jest.config.js
+
+# Development
+.env*.local
+.env.development
+.env.test
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (excluding CLAUDE.md which may be needed)
+docs/
+README.md
+
+# CI/CD (excluding itself from the build context)
+.dockerignore
+docker-compose*.yml
+
+# Other files not needed for build
+.eslintrc.json
+.prettierrc
+lighthouserc.js
+playwright.config.ts
+e2e/
+playwright-report/
+test-results/

@@ -1,0 +1,507 @@
+# GitLab CI/CD Pipeline for Next.js Portfolio
+# Following CI/CD best practices for 2025
+#
+# IMPORTANT: Registry Push/Pull Strategy
+# - PUSH: Uses internal cluster DNS (gitlab.gitlab.svc.cluster.local:5050)
+#   to avoid Cloudflare tunnel upload size limits
+# - PULL: Uses external URL (gitlab.scopecreep.productions) for reliability
+# This is critical for large Docker images
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible # Cancel running jobs when new commit pushed
+    on_job_failure: all # Cancel all pending/running jobs if any job fails
+
+stages:
+  - debug
+  - lint
+  - test
+  - e2e
+  - security
+  - build
+  - performance
+  - registry
+
+variables:
+  # Docker configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: '1'
+  DOCKER_TLS_CERTDIR: ''
+
+  # Registry configuration
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+
+  # Internal cluster DNS for pushing (avoids Cloudflare tunnel limits)
+  # Using full cluster DNS name - gitlab-registry service in gitlab namespace
+  INTERNAL_REGISTRY: 'gitlab-registry.gitlab.svc.cluster.local:5000'
+  # Use internal registry for push operations
+  PUSH_REGISTRY: 'gitlab-registry.gitlab.svc.cluster.local:5000/leth/portfolio-website'
+
+  # Node configuration
+  NODE_VERSION: '20-alpine'
+  NPM_CONFIG_CACHE: '$CI_PROJECT_DIR/.npm'
+  NEXT_TELEMETRY_DISABLED: '1'
+
+# Default job configuration
+default:
+  image: node:$NODE_VERSION
+  interruptible: true # Jobs can be cancelled on failure or new commit
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+      - node_modules/
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+
+# Debug Stage - Minimal job to test runner
+debug:runner:
+  stage: debug
+  image: alpine:latest
+  before_script: []
+  script:
+    - echo "Testing GitLab runner connectivity"
+    - echo "CI_PIPELINE_ID=$CI_PIPELINE_ID"
+    - echo "CI_JOB_ID=$CI_JOB_ID"
+    - echo "Runner is working!"
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "feature/gitlab-cicd-pipeline"
+
+# Lint Stage - runs in parallel with test and security
+lint:code:
+  stage: lint
+  needs: [] # Start immediately, don't wait for debug stage
+  script:
+    - npm run lint
+    - npm run typecheck
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+lint:format:
+  stage: lint
+  needs: [] # Start immediately
+  script:
+    - npx prettier --check .
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Test Stage - runs in parallel with lint and security
+test:unit:
+  stage: test
+  needs: [] # Start immediately, don't wait for lint stage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  script:
+    - npm run test:coverage -- --coverage-threshold='{"global":{"branches":80,"functions":80,"lines":80,"statements":80}}'
+    - echo "Test completed successfully"
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    reports:
+      junit: coverage/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    expire_in: 7 days
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Smoke test Ghost CMS connectivity from cluster
+test:ghost-api:
+  stage: test
+  needs: [] # Start immediately
+  image: curlimages/curl:latest
+  before_script: [] # No npm needed
+  variables:
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+  script:
+    - echo "Testing Ghost API connectivity from cluster..."
+    - echo "GHOST_URL=$GHOST_URL"
+    - |
+      # Check if API key is configured
+      if [ -z "$GHOST_CONTENT_API_KEY" ]; then
+        echo "ERROR: GHOST_CONTENT_API_KEY CI variable not set!"
+        echo "Please add it in GitLab > Settings > CI/CD > Variables"
+        exit 1
+      fi
+      echo "API key is configured (length: ${#GHOST_CONTENT_API_KEY})"
+    - |
+      # Test basic connectivity to Ghost
+      echo "Testing basic connectivity to Ghost..."
+      if ! curl -sf --connect-timeout 5 "${GHOST_URL}/ghost/" > /dev/null 2>&1; then
+        echo "WARNING: Cannot reach Ghost at ${GHOST_URL}"
+        echo "This may be a network/DNS issue from the runner pod"
+        # Show DNS lookup
+        nslookup ghost.ghost.svc.cluster.local 2>/dev/null || echo "nslookup not available"
+      else
+        echo "Ghost service is reachable"
+      fi
+    - |
+      # Test the Content API (follow redirects since Ghost redirects HTTP to HTTPS)
+      API_URL="${GHOST_URL}/ghost/api/content/posts/?key=${GHOST_CONTENT_API_KEY}&limit=1"
+      echo "Fetching: ${GHOST_URL}/ghost/api/content/posts/?key=***&limit=1"
+      RESPONSE=$(curl -sfL --connect-timeout 10 "$API_URL" 2>&1 || echo "CURL_FAILED")
+      if echo "$RESPONSE" | grep -q '"posts"'; then
+        echo "Ghost API responding with posts!"
+        echo "$RESPONSE" | head -c 500
+      elif [ "$RESPONSE" = "CURL_FAILED" ]; then
+        echo "ERROR: curl failed to connect to Ghost API"
+        # Try with verbose output to see what's happening
+        curl -vL --connect-timeout 10 "$API_URL" 2>&1 || true
+        exit 1
+      else
+        echo "Ghost API returned unexpected response:"
+        echo "$RESPONSE" | head -c 1000
+        exit 1
+      fi
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# E2E Stage - Playwright end-to-end tests
+test:e2e:
+  stage: e2e
+  image: mcr.microsoft.com/playwright:v1.57.0-jammy
+  needs:
+    - lint:code
+    - lint:format
+    - test:unit
+  variables:
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+    GHOST_API_KEY: $GHOST_CONTENT_API_KEY
+    SITE_URL: 'http://localhost:3003'
+    PLAYWRIGHT_BASE_URL: 'http://localhost:3003'
+    CI: 'true'
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+      - node_modules/
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npx playwright install --with-deps chromium
+    - npm run test:e2e -- --project=chromium
+  artifacts:
+    when: always
+    paths:
+      - playwright-report/
+    reports:
+      junit: playwright-report/junit.xml
+    expire_in: 7 days
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Security Stage - runs in parallel with lint and test
+security:dependencies:
+  stage: security
+  needs: [] # Start immediately
+  image: node:$NODE_VERSION
+  script:
+    - npm audit --audit-level=high
+    - npx --yes better-npm-audit audit
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+security:secrets:
+  stage: security
+  needs: [] # Start immediately
+  image: trufflesecurity/trufflehog:latest
+  before_script: [] # Override default before_script
+  script:
+    - trufflehog filesystem . --only-verified
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# Build Stage - app build runs in parallel, docker build waits for lint/test
+build:app:
+  stage: build
+  needs: [] # Start immediately (used for bundle analysis)
+  variables:
+    # Ghost API for static page generation
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+    GHOST_API_KEY: $GHOST_CONTENT_API_KEY
+  script:
+    - npm run build
+    - echo "Build size report:"
+    - du -sh .next/
+  artifacts:
+    paths:
+      - .next/
+      - public/
+    expire_in: 1 hour
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Test Docker build for MRs (full test including push/pull/cleanup)
+build:docker:test:
+  stage: build
+  needs:
+    - lint:code
+    - lint:format
+    - test:unit
+  image: docker:24 # Use CLI image, not dind
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command:
+        - --insecure-registry=gitlab-registry.gitlab.svc.cluster.local:5000
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ''
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+  before_script:
+    # Wait for Docker to be ready
+    - until docker info; do sleep 1; done
+    # Login to external registry for base images
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    # LOGIN TO INTERNAL REGISTRY FOR PUSH - This was missing!
+    - echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin gitlab-registry.gitlab.svc.cluster.local:5000
+  script:
+    # Build for MR pipelines (no-cache to ensure fresh build)
+    - docker build --no-cache --target production --build-arg GHOST_URL=$GHOST_URL --build-arg GHOST_API_KEY=$GHOST_CONTENT_API_KEY -t $IMAGE_NAME:mr-$CI_MERGE_REQUEST_IID .
+    - echo "Docker build successful!"
+
+    # Test push to internal HTTP registry (with MR-specific tag)
+    - echo "Testing push to internal registry (HTTP)..."
+    - docker tag $IMAGE_NAME:mr-$CI_MERGE_REQUEST_IID $PUSH_REGISTRY:mr-test-$CI_MERGE_REQUEST_IID
+    - docker push $PUSH_REGISTRY:mr-test-$CI_MERGE_REQUEST_IID
+    - echo "Push to internal registry successful!"
+
+    # Test that the image actually runs
+    - docker run -d --name test-container -p 3000:3000 $IMAGE_NAME:mr-$CI_MERGE_REQUEST_IID
+    - sleep 10
+    - docker exec test-container wget -qO- http://localhost:3000/api/health || exit 1
+    - echo "Container health check passed!"
+    - docker stop test-container
+    - docker rm test-container
+
+    - echo "Docker build, push, and runtime test completed successfully for MR!"
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+
+# Full Docker build with registry push
+build:docker:
+  stage: build
+  needs:
+    - lint:code
+    - lint:format
+    - test:unit
+  image: docker:24 # Use CLI image, not dind
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command:
+        - --insecure-registry=gitlab-registry.gitlab.svc.cluster.local:5000
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ''
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+  before_script:
+    # Wait for Docker to be ready
+    - until docker info; do sleep 1; done
+    # Login to external registry for pulling base images
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    # Login to internal registry for push
+    - echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin gitlab-registry.gitlab.svc.cluster.local:5000
+  script:
+    # Build with external registry tag for base image pulls
+    - docker build --target production --build-arg GHOST_URL=$GHOST_URL --build-arg GHOST_API_KEY=$GHOST_CONTENT_API_KEY -t $IMAGE_NAME:$IMAGE_TAG .
+    # Tag for internal registry push
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $PUSH_REGISTRY:$IMAGE_TAG
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $PUSH_REGISTRY:$CI_COMMIT_REF_SLUG
+    # Create timestamped tag for Flux image automation (main branch only)
+    # Format: main-<unix_timestamp>-<short_sha> for reliable ordering
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        FLUX_TAG="main-$(date +%s)-${CI_COMMIT_SHORT_SHA}"
+        docker tag $IMAGE_NAME:$IMAGE_TAG $PUSH_REGISTRY:$FLUX_TAG
+        echo "Created Flux automation tag: $FLUX_TAG"
+      fi
+    # Push to internal registry (fast, avoids Cloudflare tunnel limits)
+    - docker push ${PUSH_REGISTRY}:${IMAGE_TAG}
+    - docker push ${PUSH_REGISTRY}:${CI_COMMIT_REF_SLUG}
+    - test "$CI_COMMIT_BRANCH" = "main" && docker push ${PUSH_REGISTRY}:${FLUX_TAG} || true
+    - echo "Image pushed to internal registry ${PUSH_REGISTRY}:${IMAGE_TAG}"
+    # Note: Flux image automation will detect the new main-* tag and update the deployment
+  rules:
+    # Run on all dev/main commits - blog content is baked into image at build time
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Performance Stage
+performance:bundle:
+  stage: performance
+  needs:
+    - job: build:app
+      optional: true
+  variables:
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+    GHOST_API_KEY: $GHOST_CONTENT_API_KEY
+  script:
+    - npm install -g @next/bundle-analyzer
+    - ANALYZE=true npm run build > bundle-report.txt
+    - echo "Bundle Analysis Complete"
+    - cat bundle-report.txt | grep -E "(First Load JS|Page|Lambda)"
+  artifacts:
+    paths:
+      - bundle-report.txt
+    expire_in: 1 week
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+performance:lighthouse:
+  stage: performance
+  # Use Playwright image - has Node 22 and Chrome (Lighthouse requires Node 20.10+ for import assertions)
+  image: mcr.microsoft.com/playwright:v1.57.0-jammy
+  needs:
+    - job: build:app
+      optional: true
+  variables:
+    GHOST_URL: 'http://ghost.ghost.svc.cluster.local:2368'
+    GHOST_API_KEY: $GHOST_CONTENT_API_KEY
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npm install -g @lhci/cli
+    - npm run build
+    - lhci autorun --config=./lighthouserc.js || echo "Lighthouse completed with warnings"
+  artifacts:
+    paths:
+      - .lighthouseci/
+    expire_in: 1 week
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# Registry Stage
+# Note: registry:push removed - push happens in build:docker job (best practice)
+
+# Verify the pushed image can be pulled and runs
+registry:verify:
+  stage: registry
+  image: docker:24 # Use CLI image, not dind
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command:
+        - --insecure-registry=gitlab-registry.gitlab.svc.cluster.local:5000
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ''
+  needs: ['build:docker']
+  before_script:
+    # Wait for Docker to be ready
+    - until docker info; do sleep 1; done
+    # Login to external registry
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    # Login to internal registry to pull the image we pushed
+    - echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin gitlab-registry.gitlab.svc.cluster.local:5000
+  script:
+    # Note: Image was pushed to internal registry, should be accessible from external
+    - echo "Verifying image is accessible from external registry endpoint..."
+    - docker pull ${IMAGE_NAME}:${IMAGE_TAG} || true # Image may not be in external registry yet
+    # Pull from internal registry where we know it exists
+    - echo "Pulling image from internal registry to test..."
+    - docker pull ${PUSH_REGISTRY}:${IMAGE_TAG}
+    # Test that the image runs and responds to health check
+    - echo "Starting container to verify it runs..."
+    - docker run -d --name test-container -p 3000:3000 ${PUSH_REGISTRY}:${IMAGE_TAG}
+    - sleep 10
+    - echo "Testing health endpoint..."
+    - docker exec test-container wget -qO- http://localhost:3000/api/health || exit 1
+    - echo "Image verification successful!"
+    - docker stop test-container
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+registry:scan:
+  stage: registry
+  image: aquasec/trivy:latest
+  needs: ['build:docker']
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - script_failure
+  before_script:
+    # Use GitHub Container Registry mirror for better reliability
+    - export TRIVY_DB_REPOSITORY="ghcr.io/aquasecurity/trivy-db"
+    # Trivy needs credentials to pull from the internal registry where we pushed
+    - export TRIVY_USERNAME="gitlab-ci-token"
+    - export TRIVY_PASSWORD="$CI_JOB_TOKEN"
+    - export TRIVY_AUTH_URL="gitlab-registry.gitlab.svc.cluster.local:5000"
+    # Tell Trivy to allow insecure registry
+    - export TRIVY_INSECURE=true
+  script:
+    # Scan the image from internal registry (where we actually pushed it)
+    - trivy image --exit-code 0 --no-progress --format table --ignorefile .trivyignore $PUSH_REGISTRY:$IMAGE_TAG
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress --ignorefile .trivyignore $PUSH_REGISTRY:$IMAGE_TAG
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Test registry scanning in MR pipelines (uses the test image)
+registry:scan:test:
+  stage: registry
+  image: aquasec/trivy:latest
+  needs: ['build:docker:test']
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - script_failure
+  before_script:
+    # Use GitHub Container Registry mirror for better reliability
+    - export TRIVY_DB_REPOSITORY="ghcr.io/aquasecurity/trivy-db"
+    # Trivy needs credentials to pull from the internal registry
+    - export TRIVY_USERNAME="gitlab-ci-token"
+    - export TRIVY_PASSWORD="$CI_JOB_TOKEN"
+    - export TRIVY_AUTH_URL="gitlab-registry.gitlab.svc.cluster.local:5000"
+    # Tell Trivy to allow insecure registry
+    - export TRIVY_INSECURE=true
+  script:
+    # Scan the MR test image from internal registry
+    - echo "Scanning MR test image for vulnerabilities..."
+    - trivy image --exit-code 0 --no-progress --format table --ignorefile .trivyignore $PUSH_REGISTRY:mr-test-$CI_MERGE_REQUEST_IID
+    - echo "Checking for HIGH/CRITICAL vulnerabilities..."
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress --ignorefile .trivyignore $PUSH_REGISTRY:mr-test-$CI_MERGE_REQUEST_IID
+  allow_failure: true
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+# Deploy Stage - Flux handles deployment via GitOps
+# CI only needs to push images; Flux image automation detects new tags
+# and updates the deployment manifest automatically
+# No CI deploy jobs needed - Flux watches for new image tags

@@ -1,0 +1,14 @@
+{
+  "folders": [
+    {
+      "path": ".",
+    },
+    {
+      "path": "../../gitops/flux",
+    },
+    {
+      "path": "../../k3s/portfolio",
+    },
+  ],
+  "settings": {},
+}
